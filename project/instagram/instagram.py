@@ -14,10 +14,10 @@ from common import *
 from common import crypto
 
 IS_LOCAL_SAVE_SESSION = False
-PHOTO_COUNT_PER_PAGE = 12
+EACH_PAGE_PHOTO_COUNT = 12  # 每次请求获取的媒体数量
 QUERY_ID = "17859156310193001"
 COOKIE_INFO = {"csrftoken": "", "mid": "", "sessionid": ""}
-SESSION_FILE_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "session"))
+SESSION_DATA_PATH = None
 
 
 # 生成session cookies
@@ -38,9 +38,9 @@ def init_session():
 
 # 检测登录状态
 def check_login():
-    if not COOKIE_INFO["sessionid"]:
+    if not COOKIE_INFO["sessionid"] and SESSION_DATA_PATH is not None:
         # 从文件中读取账号密码
-        account_data = tool.json_decode(crypto.Crypto().decrypt(file.read_file(SESSION_FILE_PATH)), {})
+        account_data = tool.json_decode(crypto.Crypto().decrypt(file.read_file(SESSION_DATA_PATH)), {})
         if crawler.check_sub_key(("email", "password"), account_data):
             if _do_login(account_data["email"], account_data["password"]):
                 return True
@@ -63,8 +63,8 @@ def login_from_console():
             input_str = input_str.lower()
             if input_str in ["y", "yes"]:
                 if _do_login(email, password):
-                    if IS_LOCAL_SAVE_SESSION:
-                        file.write_file(crypto.Crypto().encrypt(json.dumps({"email": email, "password": password})), SESSION_FILE_PATH, file.WRITE_FILE_TYPE_REPLACE)
+                    if IS_LOCAL_SAVE_SESSION and SESSION_DATA_PATH is not None:
+                        file.write_file(crypto.Crypto().encrypt(json.dumps({"email": email, "password": password})), SESSION_DATA_PATH, file.WRITE_FILE_TYPE_REPLACE)
                     return True
                 return False
             elif input_str in ["n", "no"]:
@@ -78,7 +78,7 @@ def _do_login(email, password):
     header_list = {"referer": "https://www.instagram.com/", "x-csrftoken": COOKIE_INFO["csrftoken"]}
     login_response = net.http_request(login_url, method="POST", fields=login_post, cookies_list=COOKIE_INFO, header_list=header_list, json_decode=True)
     if login_response.status == net.HTTP_RETURN_CODE_SUCCEED:
-        if crawler.check_sub_key(("authenticated",), login_response.json_data) and login_response.json_data["authenticated"] is True:
+        if crawler.get_json_value(login_response.json_data, "authenticated", default_value=False, type_check=bool) is True:
             set_cookie = net.get_cookies_from_response_header(login_response.headers)
             if "sessionid" in set_cookie:
                 COOKIE_INFO["sessionid"] = set_cookie["sessionid"]
@@ -112,7 +112,7 @@ def get_one_page_media(account_id, cursor):
     query_data = {
         "query_id": QUERY_ID,
         "id": account_id,
-        "first": PHOTO_COUNT_PER_PAGE,
+        "first": EACH_PAGE_PHOTO_COUNT,
     }
     if cursor:
         query_data["after"] = cursor
@@ -123,26 +123,17 @@ def get_one_page_media(account_id, cursor):
     }
     if media_pagination_response.status != net.HTTP_RETURN_CODE_SUCCEED:
         raise crawler.CrawlerException(crawler.request_failre(media_pagination_response.status))
-    json_data = media_pagination_response.json_data
-    try:
-        media_data = media_pagination_response.json_data["data"]["user"]["edge_owner_to_timeline_media"]
-    except KeyError:
-        raise crawler.CrawlerException("返回数据格式不正确\n%s" % media_pagination_response.json_data)
-    if not crawler.check_sub_key(("page_info", "edges", "count"), media_data):
-        raise crawler.CrawlerException("返回数据'page_info', 'edges', 'count'字段不存在\n%s" % json_data)
-    if not crawler.check_sub_key(("end_cursor", "has_next_page"), media_data["page_info"]):
-        raise crawler.CrawlerException("返回数据'end_cursor', 'has_next_page'字段不存在\n%s" % json_data)
-    if not isinstance(media_data["edges"], list):
-        raise crawler.CrawlerException("返回数据'edges'字段类型不正确\n%s" % json_data)
-    if len(media_data["edges"]) == 0:
+    response_media = crawler.get_json_value(media_pagination_response.json_data, "data", "user", "edge_owner_to_timeline_media", type_check=dict)
+    media_info_list = crawler.get_json_value(response_media, "edges", type_check=list)
+    if len(media_info_list) == 0:
         if cursor == "":
-            if int(media_data["count"]) > 0:
+            if crawler.get_json_value(response_media, "count", type_check=int) > 0:
                 raise crawler.CrawlerException("私密账号，需要关注才能访问")
             else:  # 没有发布任何帖子
                 return result
         else:
-            raise crawler.CrawlerException("返回数据'edges'字段长度不正确\n%s" % json_data)
-    for media_info in media_data["edges"]:
+            raise crawler.CrawlerException("'edges'字段长度不正确\n%s" % media_pagination_response.json_data)
+    for media_info in media_info_list:
         result_media_info = {
             "photo_url": None,  # 图片地址
             "is_group": False,  # 是不是图片/视频组
@@ -150,27 +141,24 @@ def get_one_page_media(account_id, cursor):
             "page_id": None,  # 媒体详情界面id
             "time": None,  # 媒体上传时间
         }
-        if not crawler.check_sub_key(("node",), media_info):
-            raise crawler.CrawlerException("媒体信息'node'字段不存在\n%s" % media_info)
-        if not crawler.check_sub_key(("display_url", "taken_at_timestamp", "__typename", "shortcode",), media_info["node"]):
-            raise crawler.CrawlerException("媒体信息'display_url', 'taken_at_timestamp', '__typename', 'shortcode'字段不存在\n%s" % media_info)
+        media_type = crawler.get_json_value(media_info, "node", "__typename", type_check=str)
         # GraphImage 单张图片、GraphSidecar 多张图片、GraphVideo 视频
-        if media_info["node"]["__typename"] not in ["GraphImage", "GraphSidecar", "GraphVideo"]:
+        if media_type not in ["GraphImage", "GraphSidecar", "GraphVideo"]:
             raise crawler.CrawlerException("媒体信息'__typename'取值范围不正确\n%s" % media_info)
         # 获取图片地址
-        result_media_info["photo_url"] = media_info["node"]["display_url"]
+        result_media_info["photo_url"] = crawler.get_json_value(media_info, "node", "display_url", type_check=str)
         # 判断是不是图片/视频组
-        result_media_info["is_group"] = media_info["node"]["__typename"] == "GraphSidecar"
+        result_media_info["is_group"] = media_type == "GraphSidecar"
         # 判断是否有视频
-        result_media_info["is_video"] = media_info["node"]["__typename"] == "GraphVideo"
+        result_media_info["is_video"] = media_type == "GraphVideo"
         # 获取图片上传时间
-        result_media_info["media_time"] = int(media_info["node"]["taken_at_timestamp"])
+        result_media_info["media_time"] = crawler.get_json_value(media_info, "node", "taken_at_timestamp", type_check=int)
         # 获取媒体详情界面id
         result_media_info["page_id"] = media_info["node"]["shortcode"]
         result["media_info_list"].append(result_media_info)
     # 获取下一页的指针
-    if media_data["page_info"]["has_next_page"]:
-        result["next_page_cursor"] = media_data["page_info"]["end_cursor"]
+    if crawler.get_json_value(response_media, "page_info", "has_next_page", type_check=bool):
+        result["next_page_cursor"] = crawler.get_json_value(response_media, "page_info", "end_cursor", type_check=str)
     return result
 
 
@@ -185,57 +173,39 @@ def get_media_page(page_id):
     if media_response.status != net.HTTP_RETURN_CODE_SUCCEED:
         raise crawler.CrawlerException(crawler.request_failre(media_response.status))
     media_response_content = media_response.data.decode(errors="ignore")
-    media_info_html = tool.find_sub_string(media_response_content, "window._sharedData = ", ";</script>")
-    if not media_info_html:
+    script_json_html = tool.find_sub_string(media_response_content, "window._sharedData = ", ";</script>")
+    if not script_json_html:
         crawler.CrawlerException("页面截取媒体信息失败\n%s" % media_response_content)
-    media_info_data = tool.json_decode(media_info_html)
-    if media_info_data is None:
-        raise crawler.CrawlerException("媒体信息加载失败\n%s" % media_info_html)
-    try:
-        media_data = media_info_data["entry_data"]["PostPage"][0]["graphql"]["shortcode_media"]
-    except KeyError:
-        raise crawler.CrawlerException("媒体信息格式不正确\n%s" % media_info_data)
-    except IndexError:
-        raise crawler.CrawlerException("媒体信息格式不正确\n%s" % media_info_data)
-    if len(media_info_data["entry_data"]["PostPage"]) != 1:
-        raise crawler.CrawlerException("媒体信息'PostPage'字段长度不正确\n%s" % media_info_data)
-    if not crawler.check_sub_key(("__typename",), media_data):
-        raise crawler.CrawlerException("媒体信息'__typename'字段不存在\n%s" % media_info_data)
+    script_json = tool.json_decode(script_json_html)
+    if script_json is None:
+        raise crawler.CrawlerException("媒体信息加载失败\n%s" % script_json_html)
+    media_info = crawler.get_json_value(script_json, "entry_data", "PostPage", 0, "graphql", "shortcode_media", type_check=dict)
+    media_type = crawler.get_json_value(media_info, "__typename", type_check=str)
     # 多张图片/视频
-    if media_data["__typename"] == "GraphSidecar":
-        try:
-            media_edge_data = media_data["edge_sidecar_to_children"]["edges"]
-        except KeyError:
-            raise crawler.CrawlerException("图片信息格式不正确\n%s" % media_data)
-        if len(media_edge_data) < 2:
-            raise crawler.CrawlerException("媒体信息'edges'长度不正确\n%s" % media_data)
-        for edge in media_edge_data:
-            if not crawler.check_sub_key(("node",), edge):
-                raise crawler.CrawlerException("媒体节点'node'字段不存在\n%s" % edge)
-            if not crawler.check_sub_key(("__typename", "display_url"), edge["node"]):
-                raise crawler.CrawlerException("媒体节点'__typename'或'display_url'字段不存在\n%s" % edge)
+    if media_type == "GraphSidecar":
+        edge_info_list = crawler.get_json_value(media_info, "edge_sidecar_to_children", "edges", type_check=list)
+        if len(edge_info_list) < 2:
+            raise crawler.CrawlerException("'edges'长度不正确\n%s" % script_json)
+        for edge_info in edge_info_list:
             # 获取图片地址
-            result["photo_url_list"].append(edge["node"]["display_url"])
+            result["photo_url_list"].append(crawler.get_json_value(edge_info, "node", "display_url", type_check=str))
             # 获取视频地址
-            if edge["node"]["__typename"] == "GraphVideo":
-                if not crawler.check_sub_key(("video_url",), edge["node"]):
-                    raise crawler.CrawlerException("视频节点'video_url'字段不存在\n%s" % edge)
-                result["video_url_list"].append(edge["node"]["video_url"])
+            if crawler.get_json_value(edge_info, "node", "__typename", type_check=str) == "GraphVideo":
+                result["video_url_list"].append(crawler.get_json_value(edge_info, "node", "video_url", type_check=str))
     # 视频
-    elif media_data["__typename"] == "GraphVideo":
+    elif media_type == "GraphVideo":
         # 获取视频地址
-        if not crawler.check_sub_key(("video_url",), media_data):
-            raise crawler.CrawlerException("视频信息'video_url'字段不存在\n%s" % media_data)
-        result["video_url_list"].append(media_data["video_url"])
+        result["video_url_list"].append(crawler.get_json_value(media_info, "video_url", type_check=str))
     else:
-        raise crawler.CrawlerException("媒体信息'__typename'取值范围不正确\n%s" % media_info_data)
+        raise crawler.CrawlerException("'__typename'取值范围不正确\n%s" % script_json)
     return result
 
 
 class Instagram(crawler.Crawler):
-    def __init__(self, extra_config=None):
+    def __init__(self, **kwargs):
         global COOKIE_INFO
         global IS_LOCAL_SAVE_SESSION
+        global SESSION_DATA_PATH
 
         # 设置APP目录
         crawler.PROJECT_APP_PATH = os.path.abspath(os.path.dirname(__file__))
@@ -250,11 +220,12 @@ class Instagram(crawler.Crawler):
                 ("IS_LOCAL_SAVE_SESSION", False, crawler.CONFIG_ANALYSIS_MODE_BOOLEAN),
             ),
         }
-        crawler.Crawler.__init__(self, sys_config, extra_config)
+        crawler.Crawler.__init__(self, sys_config, **kwargs)
 
         # 设置全局变量，供子线程调用
         COOKIE_INFO.update(self.cookie_value)
         IS_LOCAL_SAVE_SESSION = self.app_config["IS_LOCAL_SAVE_SESSION"]
+        SESSION_DATA_PATH = self.session_data_path
 
         # 解析存档文件
         # account_name  account_id  photo_count  video_count  last_created_time
@@ -352,6 +323,8 @@ class Download(crawler.DownloadThread):
 
     # 解析单个媒体
     def crawl_media(self, media_info):
+        self.step("开始解析媒体 %s" % media_info["page_id"])
+
         media_response = None
         # 图片下载
         photo_index = int(self.account_info[2]) + 1
@@ -390,7 +363,6 @@ class Download(crawler.DownloadThread):
         # 视频下载
         video_index = int(self.account_info[3]) + 1
         if self.main_thread.is_download_video and (media_info["is_group"] or media_info["is_video"]):
-            self.main_thread_check()  # 检测主线程运行状态
             # 如果图片那里没有获取过媒体页面，需要重新获取一下
             if media_response is None:
                 # 获取媒体详细页
@@ -447,9 +419,7 @@ class Download(crawler.DownloadThread):
 
             # 从最早的媒体开始下载
             while len(media_info_list) > 0:
-                media_info = media_info_list.pop()
-                self.step("开始解析媒体 %s" % media_info["page_id"])
-                self.crawl_media(media_info)
+                self.crawl_media(media_info_list.pop())
                 self.main_thread_check()  # 检测主线程运行状态
         except SystemExit as se:
             if se.code == 0:
